@@ -9,6 +9,7 @@ import json
 import os
 from datetime import datetime, timezone
 from threading import Lock
+import google.generativeai as genai
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for frontend integration
@@ -26,6 +27,146 @@ CURRICULUM_FILES = {
 }
 
 CURRICULUM_CACHE = {}
+
+# Gemini API Configuration
+GEMINI_API_KEY = "AIzaSyAnmhYDKkezEorWWxktcXhMbryrcndQCJM"
+genai.configure(api_key=GEMINI_API_KEY)
+
+# ============================================================================
+# AI LEARNING GUIDANCE HELPERS
+# ============================================================================
+
+def build_curriculum_context(subject):
+    """
+    Build a structured curriculum context for AI guidance.
+    
+    Args:
+        subject (str): Subject name (mathematics, aiml, programming_c)
+        
+    Returns:
+        dict: Structured curriculum with all levels and modules
+    """
+    curriculum = load_curriculum(subject)
+    if not curriculum:
+        return None
+    
+    context = {
+        'subject': subject,
+        'levels': {}
+    }
+    
+    for level_name, level_data in curriculum.get('levels', {}).items():
+        modules_list = []
+        for module in level_data.get('modules', []):
+            modules_list.append({
+                'module_id': module.get('module_id'),
+                'module_name': module.get('module_header', {}).get('module_title', module.get('module_name', 'Unknown')),
+                'prerequisites': module.get('module_header', {}).get('prerequisites', [])
+            })
+        context['levels'][level_name] = modules_list
+    
+    return context
+
+
+def create_learning_guidance_prompt(subject, level, module_name, curriculum_context, user_message=""):
+    """
+    Create a prompt for Gemini with academic guardrails.
+    
+    Args:
+        subject (str): Subject name
+        level (str): Current level (beginner/intermediate/advanced)
+        module_name (str): Current module name
+        curriculum_context (dict): Full curriculum structure
+        user_message (str): Optional user message
+        
+    Returns:
+        str: Formatted prompt for Gemini
+    """
+    # Build curriculum structure text
+    curriculum_text = f"Subject: {subject.upper()}\n\n"
+    for lvl, modules in curriculum_context['levels'].items():
+        curriculum_text += f"{lvl.upper()} Level:\n"
+        for idx, mod in enumerate(modules, 1):
+            curriculum_text += f"  {idx}. {mod['module_name']}"
+            if mod.get('prerequisites'):
+                curriculum_text += f" (Prerequisites: {', '.join(mod['prerequisites'][:2])}...)"
+            curriculum_text += "\n"
+        curriculum_text += "\n"
+    
+    # System instruction (academic guardrails)
+    system_instruction = """You are an academic learning guidance assistant for an educational platform.
+
+YOUR ROLE:
+- Help students navigate the curriculum when they are stuck on a module
+- Suggest prerequisite or related modules from lower or same levels
+- Encourage revisiting concept overviews, intuition, and worked examples
+
+YOU MUST NOT:
+- Answer quiz questions or provide quiz solutions
+- Solve academic problems directly
+- Give away answers to assignments or exercises
+- Make decisions about student progression or scores
+
+WHEN ASKED INAPPROPRIATE QUESTIONS:
+- Politely refuse and redirect to learning resources
+- Suggest: "Please revisit the relevant modules and examples."
+- Reinforce learning, not shortcuts
+
+YOUR RESPONSES MUST:
+- Be brief and academically appropriate (2-4 sentences)
+- Reference only modules that exist in the provided curriculum
+- Focus on learning paths and prerequisite understanding
+- Be encouraging and supportive"""
+    
+    # User prompt
+    user_prompt = f"""Student is struggling with:
+Subject: {subject}
+Level: {level}
+Module: {module_name}
+
+"""
+    
+    if user_message:
+        user_prompt += f"Student's question: \"{user_message}\"\n\n"
+    
+    user_prompt += f"""Available curriculum structure:
+{curriculum_text}
+
+Based on the curriculum structure above, suggest which modules the student should revisit to improve understanding of \"{module_name}\". Be specific and reference actual module names from the curriculum."""
+    
+    return system_instruction, user_prompt
+
+
+def call_gemini_api(system_instruction, user_prompt):
+    """
+    Call Gemini API with the constructed prompt.
+    
+    Args:
+        system_instruction (str): System-level instructions
+        user_prompt (str): User-specific prompt
+        
+    Returns:
+        tuple: (success: bool, response: str)
+    """
+    try:
+        # Use gemini-2.5-flash-lite model (verified working model)
+        # Combine system instruction with user prompt for compatibility
+        model = genai.GenerativeModel(model_name='models/gemini-2.5-flash-lite')
+        
+        # Combine system instruction and user prompt
+        full_prompt = f"{system_instruction}\n\n{user_prompt}"
+        
+        response = model.generate_content(full_prompt)
+        
+        if response and response.text:
+            return True, response.text.strip()
+        else:
+            return False, "Unable to generate guidance at this time."
+            
+    except Exception as e:
+        print(f"Gemini API Error: {str(e)}")
+        return False, "An error occurred while generating guidance. Please try again."
+
 
 # ============================================================================
 # PROGRESS TRACKING HELPERS
@@ -561,6 +702,82 @@ def list_modules():
             'error': str(e)
         }), 500
 
+@app.route('/api/learning-assist', methods=['POST'])
+def learning_assist():
+    """
+    AI Learning Guidance Endpoint
+    
+    Provides curriculum navigation assistance using Gemini API.
+    Suggests prerequisite modules without answering quiz questions.
+    
+    Request JSON format:
+    {
+        "subject": "mathematics",
+        "level": "intermediate",
+        "module": "linear_equations",
+        "user_message": "I'm stuck on this module" (optional)
+    }
+    
+    Response JSON format:
+    {
+        "success": true,
+        "guidance": "AI-generated guidance text"
+    }
+    """
+    try:
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({
+                'success': False,
+                'error': 'No data provided'
+            }), 400
+        
+        subject = data.get('subject', 'mathematics')
+        level = data.get('level')
+        module = data.get('module')
+        user_message = data.get('user_message', '')
+        
+        if not level or not module:
+            return jsonify({
+                'success': False,
+                'error': 'level and module are required'
+            }), 400
+        
+        # Build curriculum context
+        curriculum_context = build_curriculum_context(subject)
+        if not curriculum_context:
+            return jsonify({
+                'success': False,
+                'error': f'Failed to load curriculum for subject: {subject}'
+            }), 500
+        
+        # Create prompt with academic guardrails
+        system_instruction, user_prompt = create_learning_guidance_prompt(
+            subject, level, module, curriculum_context, user_message
+        )
+        
+        # Call Gemini API
+        success, guidance = call_gemini_api(system_instruction, user_prompt)
+        
+        if not success:
+            return jsonify({
+                'success': False,
+                'error': guidance
+            }), 500
+        
+        return jsonify({
+            'success': True,
+            'guidance': guidance
+        }), 200
+    
+    except Exception as e:
+        print(f"Error in learning_assist endpoint: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': 'Internal server error'
+        }), 500
+
 if __name__ == '__main__':
     print("=" * 60)
     print("Module Summarization API Starting...")
@@ -582,8 +799,10 @@ if __name__ == '__main__':
     print("  POST /api/progress/save   - Save quiz result & track progress")
     print("  GET  /api/progress        - Get all progress data")
     print("  GET  /api/progress/<id>   - Get specific module progress")
+    print("  POST /api/learning-assist - AI learning guidance (Gemini)")
     print("\nProgress File: " + PROGRESS_FILE_PATH)
     print(f"Pass Threshold: {PASS_THRESHOLD}%")
+    print("\nAI Learning Assistant: ENABLED (Gemini API)")
     print("\nStarting server on http://localhost:5000")
     print("=" * 60)
     
